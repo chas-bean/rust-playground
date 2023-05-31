@@ -1,0 +1,491 @@
+<?xml version="1.0" standalone="no"?><!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd"><svg version="1.1" width="1200" height="518" onload="init(evt)" viewBox="0 0 1200 518" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xmlns:fg="http://github.com/jonhoo/inferno"><!--Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples.--><!--NOTES: --><defs><linearGradient id="background" y1="0" y2="1" x1="0" x2="0"><stop stop-color="#eeeeee" offset="5%"/><stop stop-color="#eeeeb0" offset="95%"/></linearGradient></defs><style type="text/css">
+text { font-family:monospace; font-size:12px }
+#title { text-anchor:middle; font-size:17px; }
+#matched { text-anchor:end; }
+#search { text-anchor:end; opacity:0.1; cursor:pointer; }
+#search:hover, #search.show { opacity:1; }
+#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+#unzoom { cursor:pointer; }
+#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+.hide { display:none; }
+.parent { opacity:0.5; }
+</style><script type="text/ecmascript"><![CDATA[
+        var nametype = 'Function:';
+        var fontsize = 12;
+        var fontwidth = 0.59;
+        var xpad = 10;
+        var inverted = false;
+        var searchcolor = 'rgb(230,0,230)';
+        var fluiddrawing = true;
+        var truncate_text_right = false;
+    ]]><![CDATA["use strict";
+var details, searchbtn, unzoombtn, matchedtxt, svg, searching, frames, known_font_width;
+function init(evt) {
+    details = document.getElementById("details").firstChild;
+    searchbtn = document.getElementById("search");
+    unzoombtn = document.getElementById("unzoom");
+    matchedtxt = document.getElementById("matched");
+    svg = document.getElementsByTagName("svg")[0];
+    frames = document.getElementById("frames");
+    known_font_width = get_monospace_width(frames);
+    total_samples = parseInt(frames.attributes.total_samples.value);
+    searching = 0;
+
+    // Use GET parameters to restore a flamegraph's state.
+    var restore_state = function() {
+        var params = get_params();
+        if (params.x && params.y)
+            zoom(find_group(document.querySelector('[*|x="' + params.x + '"][y="' + params.y + '"]')));
+        if (params.s)
+            search(params.s);
+    };
+
+    if (fluiddrawing) {
+        // Make width dynamic so the SVG fits its parent's width.
+        svg.removeAttribute("width");
+        // Edge requires us to have a viewBox that gets updated with size changes.
+        var isEdge = /Edge\/\d./i.test(navigator.userAgent);
+        if (!isEdge) {
+            svg.removeAttribute("viewBox");
+        }
+        var update_for_width_change = function() {
+            if (isEdge) {
+                svg.attributes.viewBox.value = "0 0 " + svg.width.baseVal.value + " " + svg.height.baseVal.value;
+            }
+
+            // Keep consistent padding on left and right of frames container.
+            frames.attributes.width.value = svg.width.baseVal.value - xpad * 2;
+
+            // Text truncation needs to be adjusted for the current width.
+            update_text_for_elements(frames.children);
+
+            // Keep search elements at a fixed distance from right edge.
+            var svgWidth = svg.width.baseVal.value;
+            searchbtn.attributes.x.value = svgWidth - xpad;
+            matchedtxt.attributes.x.value = svgWidth - xpad;
+        };
+        window.addEventListener('resize', function() {
+            update_for_width_change();
+        });
+        // This needs to be done asynchronously for Safari to work.
+        setTimeout(function() {
+            unzoom();
+            update_for_width_change();
+            restore_state();
+        }, 0);
+    } else {
+        restore_state();
+    }
+}
+// event listeners
+window.addEventListener("click", function(e) {
+    var target = find_group(e.target);
+    if (target) {
+        if (target.nodeName == "a") {
+            if (e.ctrlKey === false) return;
+            e.preventDefault();
+        }
+        if (target.classList.contains("parent")) unzoom();
+        zoom(target);
+
+        // set parameters for zoom state
+        var el = target.querySelector("rect");
+        if (el && el.attributes && el.attributes.y && el.attributes["fg:x"]) {
+            var params = get_params()
+            params.x = el.attributes["fg:x"].value;
+            params.y = el.attributes.y.value;
+            history.replaceState(null, null, parse_params(params));
+        }
+    }
+    else if (e.target.id == "unzoom") {
+        unzoom();
+
+        // remove zoom state
+        var params = get_params();
+        if (params.x) delete params.x;
+        if (params.y) delete params.y;
+        history.replaceState(null, null, parse_params(params));
+    }
+    else if (e.target.id == "search") search_prompt();
+}, false)
+// mouse-over for info
+// show
+window.addEventListener("mouseover", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = nametype + " " + g_to_text(target);
+}, false)
+// clear
+window.addEventListener("mouseout", function(e) {
+    var target = find_group(e.target);
+    if (target) details.nodeValue = ' ';
+}, false)
+// ctrl-F for search
+window.addEventListener("keydown",function (e) {
+    if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+        e.preventDefault();
+        search_prompt();
+    }
+}, false)
+// functions
+function get_params() {
+    var params = {};
+    var paramsarr = window.location.search.substr(1).split('&');
+    for (var i = 0; i < paramsarr.length; ++i) {
+        var tmp = paramsarr[i].split("=");
+        if (!tmp[0] || !tmp[1]) continue;
+        params[tmp[0]]  = decodeURIComponent(tmp[1]);
+    }
+    return params;
+}
+function parse_params(params) {
+    var uri = "?";
+    for (var key in params) {
+        uri += key + '=' + encodeURIComponent(params[key]) + '&';
+    }
+    if (uri.slice(-1) == "&")
+        uri = uri.substring(0, uri.length - 1);
+    if (uri == '?')
+        uri = window.location.href.split('?')[0];
+    return uri;
+}
+function find_child(node, selector) {
+    var children = node.querySelectorAll(selector);
+    if (children.length) return children[0];
+    return;
+}
+function find_group(node) {
+    var parent = node.parentElement;
+    if (!parent) return;
+    if (parent.id == "frames") return node;
+    return find_group(parent);
+}
+function orig_save(e, attr, val) {
+    if (e.attributes["fg:orig_" + attr] != undefined) return;
+    if (e.attributes[attr] == undefined) return;
+    if (val == undefined) val = e.attributes[attr].value;
+    e.setAttribute("fg:orig_" + attr, val);
+}
+function orig_load(e, attr) {
+    if (e.attributes["fg:orig_"+attr] == undefined) return;
+    e.attributes[attr].value = e.attributes["fg:orig_" + attr].value;
+    e.removeAttribute("fg:orig_" + attr);
+}
+function g_to_text(e) {
+    var text = find_child(e, "title").firstChild.nodeValue;
+    return (text)
+}
+function g_to_func(e) {
+    var func = g_to_text(e);
+    // if there's any manipulation we want to do to the function
+    // name before it's searched, do it here before returning.
+    return (func);
+}
+function get_monospace_width(frames) {
+    // Given the id="frames" element, return the width of text characters if
+    // this is a monospace font, otherwise return 0.
+    text = find_child(frames.children[0], "text");
+    originalContent = text.textContent;
+    text.textContent = "!";
+    bangWidth = text.getComputedTextLength();
+    text.textContent = "W";
+    wWidth = text.getComputedTextLength();
+    text.textContent = originalContent;
+    if (bangWidth === wWidth) {
+        return bangWidth;
+    } else {
+        return 0;
+    }
+}
+function update_text_for_elements(elements) {
+    // In order to render quickly in the browser, you want to do one pass of
+    // reading attributes, and one pass of mutating attributes. See
+    // https://web.dev/avoid-large-complex-layouts-and-layout-thrashing/ for details.
+
+    // Fall back to inefficient calculation, if we're variable-width font.
+    // TODO This should be optimized somehow too.
+    if (known_font_width === 0) {
+        for (var i = 0; i < elements.length; i++) {
+            update_text(elements[i]);
+        }
+        return;
+    }
+
+    var textElemNewAttributes = [];
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var r = find_child(e, "rect");
+        var t = find_child(e, "text");
+        var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+        var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+        var newX = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+        // Smaller than this size won't fit anything
+        if (w < 2 * known_font_width) {
+            textElemNewAttributes.push([newX, ""]);
+            continue;
+        }
+
+        // Fit in full text width
+        if (txt.length * known_font_width < w) {
+            textElemNewAttributes.push([newX, txt]);
+            continue;
+        }
+
+        var substringLength = Math.floor(w / known_font_width) - 2;
+        if (truncate_text_right) {
+            // Truncate the right side of the text.
+            textElemNewAttributes.push([newX, txt.substring(0, substringLength) + ".."]);
+            continue;
+        } else {
+            // Truncate the left side of the text.
+            textElemNewAttributes.push([newX, ".." + txt.substring(txt.length - substringLength, txt.length)]);
+            continue;
+        }
+    }
+
+    console.assert(textElemNewAttributes.length === elements.length, "Resize failed, please file a bug at https://github.com/jonhoo/inferno/");
+
+    // Now that we know new textContent, set it all in one go so we don't refresh a bazillion times.
+    for (var i = 0; i < elements.length; i++) {
+        var e = elements[i];
+        var values = textElemNewAttributes[i];
+        var t = find_child(e, "text");
+        t.attributes.x.value = values[0];
+        t.textContent = values[1];
+    }
+}
+
+function update_text(e) {
+    var r = find_child(e, "rect");
+    var t = find_child(e, "text");
+    var w = parseFloat(r.attributes.width.value) * frames.attributes.width.value / 100 - 3;
+    var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+    t.attributes.x.value = format_percent((parseFloat(r.attributes.x.value) + (100 * 3 / frames.attributes.width.value)));
+
+    // Smaller than this size won't fit anything
+    if (w < 2 * fontsize * fontwidth) {
+        t.textContent = "";
+        return;
+    }
+    t.textContent = txt;
+    // Fit in full text width
+    if (t.getComputedTextLength() < w)
+        return;
+    if (truncate_text_right) {
+        // Truncate the right side of the text.
+        for (var x = txt.length - 2; x > 0; x--) {
+            if (t.getSubStringLength(0, x + 2) <= w) {
+                t.textContent = txt.substring(0, x) + "..";
+                return;
+            }
+        }
+    } else {
+        // Truncate the left side of the text.
+        for (var x = 2; x < txt.length; x++) {
+            if (t.getSubStringLength(x - 2, txt.length) <= w) {
+                t.textContent = ".." + txt.substring(x, txt.length);
+                return;
+            }
+        }
+    }
+    t.textContent = "";
+}
+// zoom
+function zoom_reset(e) {
+    if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * parseInt(e.attributes["fg:x"].value) / total_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / total_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_reset(c[i]);
+    }
+}
+function zoom_child(e, x, zoomed_width_samples) {
+    if (e.tagName == "text") {
+        var parent_x = parseFloat(find_child(e.parentNode, "rect[x]").attributes.x.value);
+        e.attributes.x.value = format_percent(parent_x + (100 * 3 / frames.attributes.width.value));
+    } else if (e.tagName == "rect") {
+        e.attributes.x.value = format_percent(100 * (parseInt(e.attributes["fg:x"].value) - x) / zoomed_width_samples);
+        e.attributes.width.value = format_percent(100 * parseInt(e.attributes["fg:w"].value) / zoomed_width_samples);
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_child(c[i], x, zoomed_width_samples);
+    }
+}
+function zoom_parent(e) {
+    if (e.attributes) {
+        if (e.attributes.x != undefined) {
+            e.attributes.x.value = "0.0%";
+        }
+        if (e.attributes.width != undefined) {
+            e.attributes.width.value = "100.0%";
+        }
+    }
+    if (e.childNodes == undefined) return;
+    for(var i = 0, c = e.childNodes; i < c.length; i++) {
+        zoom_parent(c[i]);
+    }
+}
+function zoom(node) {
+    var attr = find_child(node, "rect").attributes;
+    var width = parseInt(attr["fg:w"].value);
+    var xmin = parseInt(attr["fg:x"].value);
+    var xmax = xmin + width;
+    var ymin = parseFloat(attr.y.value);
+    unzoombtn.classList.remove("hide");
+    var el = frames.children;
+    var to_update_text = [];
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        var a = find_child(e, "rect").attributes;
+        var ex = parseInt(a["fg:x"].value);
+        var ew = parseInt(a["fg:w"].value);
+        // Is it an ancestor
+        if (!inverted) {
+            var upstack = parseFloat(a.y.value) > ymin;
+        } else {
+            var upstack = parseFloat(a.y.value) < ymin;
+        }
+        if (upstack) {
+            // Direct ancestor
+            if (ex <= xmin && (ex+ew) >= xmax) {
+                e.classList.add("parent");
+                zoom_parent(e);
+                to_update_text.push(e);
+            }
+            // not in current path
+            else
+                e.classList.add("hide");
+        }
+        // Children maybe
+        else {
+            // no common path
+            if (ex < xmin || ex >= xmax) {
+                e.classList.add("hide");
+            }
+            else {
+                zoom_child(e, xmin, width);
+                to_update_text.push(e);
+            }
+        }
+    }
+    update_text_for_elements(to_update_text);
+}
+function unzoom() {
+    unzoombtn.classList.add("hide");
+    var el = frames.children;
+    for(var i = 0; i < el.length; i++) {
+        el[i].classList.remove("parent");
+        el[i].classList.remove("hide");
+        zoom_reset(el[i]);
+    }
+    update_text_for_elements(el);
+}
+// search
+function reset_search() {
+    var el = document.querySelectorAll("#frames rect");
+    for (var i = 0; i < el.length; i++) {
+        orig_load(el[i], "fill")
+    }
+    var params = get_params();
+    delete params.s;
+    history.replaceState(null, null, parse_params(params));
+}
+function search_prompt() {
+    if (!searching) {
+        var term = prompt("Enter a search term (regexp " +
+            "allowed, eg: ^ext4_)", "");
+        if (term != null) {
+            search(term)
+        }
+    } else {
+        reset_search();
+        searching = 0;
+        searchbtn.classList.remove("show");
+        searchbtn.firstChild.nodeValue = "Search"
+        matchedtxt.classList.add("hide");
+        matchedtxt.firstChild.nodeValue = ""
+    }
+}
+function search(term) {
+    var re = new RegExp(term);
+    var el = frames.children;
+    var matches = new Object();
+    var maxwidth = 0;
+    for (var i = 0; i < el.length; i++) {
+        var e = el[i];
+        // Skip over frames which are either not visible, or below the zoomed-to frame
+        if (e.classList.contains("hide") || e.classList.contains("parent")) {
+            continue;
+        }
+        var func = g_to_func(e);
+        var rect = find_child(e, "rect");
+        if (func == null || rect == null)
+            continue;
+        // Save max width. Only works as we have a root frame
+        var w = parseInt(rect.attributes["fg:w"].value);
+        if (w > maxwidth)
+            maxwidth = w;
+        if (func.match(re)) {
+            // highlight
+            var x = parseInt(rect.attributes["fg:x"].value);
+            orig_save(rect, "fill");
+            rect.attributes.fill.value = searchcolor;
+            // remember matches
+            if (matches[x] == undefined) {
+                matches[x] = w;
+            } else {
+                if (w > matches[x]) {
+                    // overwrite with parent
+                    matches[x] = w;
+                }
+            }
+            searching = 1;
+        }
+    }
+    if (!searching)
+        return;
+    var params = get_params();
+    params.s = term;
+    history.replaceState(null, null, parse_params(params));
+
+    searchbtn.classList.add("show");
+    searchbtn.firstChild.nodeValue = "Reset Search";
+    // calculate percent matched, excluding vertical overlap
+    var count = 0;
+    var lastx = -1;
+    var lastw = 0;
+    var keys = Array();
+    for (k in matches) {
+        if (matches.hasOwnProperty(k))
+            keys.push(k);
+    }
+    // sort the matched frames by their x location
+    // ascending, then width descending
+    keys.sort(function(a, b){
+        return a - b;
+    });
+    // Step through frames saving only the biggest bottom-up frames
+    // thanks to the sort order. This relies on the tree property
+    // where children are always smaller than their parents.
+    for (var k in keys) {
+        var x = parseInt(keys[k]);
+        var w = matches[keys[k]];
+        if (x >= lastx + lastw) {
+            count += w;
+            lastx = x;
+            lastw = w;
+        }
+    }
+    // display matched percent
+    matchedtxt.classList.remove("hide");
+    var pct = 100 * count / maxwidth;
+    if (pct != 100) pct = pct.toFixed(1);
+    matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+}
+function format_percent(n) {
+    return n.toFixed(4) + "%";
+}
+]]></script><rect x="0" y="0" width="100%" height="518" fill="url(#background)"/><text id="title" fill="rgb(0,0,0)" x="50.0000%" y="24.00">Flame Graph</text><text id="details" fill="rgb(0,0,0)" x="10" y="501.00"> </text><text id="unzoom" class="hide" fill="rgb(0,0,0)" x="10" y="24.00">Reset Zoom</text><text id="search" fill="rgb(0,0,0)" x="1190" y="24.00">Search</text><text id="matched" fill="rgb(0,0,0)" x="1190" y="501.00"> </text><svg id="frames" x="10" width="1180" total_samples="1713"><g><title>libsystem_m.dylib`fmod (38 samples, 2.22%)</title><rect x="0.5254%" y="309" width="2.2183%" height="15" fill="rgb(227,0,7)" fg:x="9" fg:w="38"/><text x="0.7754%" y="319.50">l..</text></g><g><title>rust-playground`&lt;alloc::vec::Vec&lt;T,A&gt; as core::ops::index::Index&lt;I&gt;&gt;::index (1 samples, 0.06%)</title><rect x="2.7437%" y="309" width="0.0584%" height="15" fill="rgb(217,0,24)" fg:x="47" fg:w="1"/><text x="2.9937%" y="319.50"></text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::guaranteed_eq (39 samples, 2.28%)</title><rect x="6.1296%" y="261" width="2.2767%" height="15" fill="rgb(221,193,54)" fg:x="105" fg:w="39"/><text x="6.3796%" y="271.50">r..</text></g><g><title>rust-playground`&lt;alloc::vec::Vec&lt;T,A&gt; as core::ops::deref::Deref&gt;::deref (92 samples, 5.37%)</title><rect x="5.4874%" y="277" width="5.3707%" height="15" fill="rgb(248,212,6)" fg:x="94" fg:w="92"/><text x="5.7374%" y="287.50">rust-pl..</text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::is_null (42 samples, 2.45%)</title><rect x="8.4063%" y="261" width="2.4518%" height="15" fill="rgb(208,68,35)" fg:x="144" fg:w="42"/><text x="8.6563%" y="271.50">ru..</text></g><g><title>rust-playground`&lt;alloc::vec::Vec&lt;T,A&gt; as core::ops::index::Index&lt;I&gt;&gt;::index (124 samples, 7.24%)</title><rect x="4.7869%" y="293" width="7.2388%" height="15" fill="rgb(232,128,0)" fg:x="82" fg:w="124"/><text x="5.0369%" y="303.50">rust-playg..</text></g><g><title>rust-playground`&lt;usize as core::slice::index::SliceIndex&lt;[T]&gt;&gt;::index (20 samples, 1.17%)</title><rect x="10.8581%" y="277" width="1.1675%" height="15" fill="rgb(207,160,47)" fg:x="186" fg:w="20"/><text x="11.1081%" y="287.50"></text></g><g><title>rust-playground`&lt;rust_playground::wavetable::WavetableIter as core::iter::traits::iterator::Iterator&gt;::next (162 samples, 9.46%)</title><rect x="2.8021%" y="309" width="9.4571%" height="15" fill="rgb(228,23,34)" fg:x="48" fg:w="162"/><text x="3.0521%" y="319.50">rust-playgroun..</text></g><g><title>rust-playground`rust_playground::wavetable::Wavetable::len (4 samples, 0.23%)</title><rect x="12.0257%" y="293" width="0.2335%" height="15" fill="rgb(218,30,26)" fg:x="206" fg:w="4"/><text x="12.2757%" y="303.50"></text></g><g><title>rust-playground`DYLD-STUB$$fmod (1 samples, 0.06%)</title><rect x="12.2592%" y="309" width="0.0584%" height="15" fill="rgb(220,122,19)" fg:x="210" fg:w="1"/><text x="12.5092%" y="319.50"></text></g><g><title>rust-playground`core::result::Result&lt;T,E&gt;::unwrap (1 samples, 0.06%)</title><rect x="12.3176%" y="309" width="0.0584%" height="15" fill="rgb(250,228,42)" fg:x="211" fg:w="1"/><text x="12.5676%" y="319.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::counter::Receiver&lt;C&gt; as core::ops::deref::Deref&gt;::deref (1 samples, 0.06%)</title><rect x="12.8430%" y="293" width="0.0584%" height="15" fill="rgb(240,193,28)" fg:x="220" fg:w="1"/><text x="13.0930%" y="303.50"></text></g><g><title>rust-playground`core::result::Result&lt;T,E&gt;::map_err (5 samples, 0.29%)</title><rect x="12.9013%" y="293" width="0.2919%" height="15" fill="rgb(216,20,37)" fg:x="221" fg:w="5"/><text x="13.1513%" y="303.50"></text></g><g><title>rust-playground`&lt;I as core::iter::traits::collect::IntoIterator&gt;::into_iter (1 samples, 0.06%)</title><rect x="13.7770%" y="277" width="0.0584%" height="15" fill="rgb(206,188,39)" fg:x="236" fg:w="1"/><text x="14.0270%" y="287.50"></text></g><g><title>rust-playground`&lt;core::option::Option&lt;T&gt; as core::default::Default&gt;::default (1 samples, 0.06%)</title><rect x="13.8354%" y="277" width="0.0584%" height="15" fill="rgb(217,207,13)" fg:x="237" fg:w="1"/><text x="14.0854%" y="287.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::flavors::array::ArrayToken as core::default::Default&gt;::default (3 samples, 0.18%)</title><rect x="13.8938%" y="277" width="0.1751%" height="15" fill="rgb(231,73,38)" fg:x="238" fg:w="3"/><text x="14.1438%" y="287.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::flavors::list::ListToken as core::default::Default&gt;::default (2 samples, 0.12%)</title><rect x="14.0689%" y="277" width="0.1168%" height="15" fill="rgb(225,20,46)" fg:x="241" fg:w="2"/><text x="14.3189%" y="287.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::flavors::zero::ZeroToken as core::default::Default&gt;::default (6 samples, 0.35%)</title><rect x="14.1856%" y="277" width="0.3503%" height="15" fill="rgb(210,31,41)" fg:x="243" fg:w="6"/><text x="14.4356%" y="287.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::select::Token as core::default::Default&gt;::default (5 samples, 0.29%)</title><rect x="14.5359%" y="277" width="0.2919%" height="15" fill="rgb(221,200,47)" fg:x="249" fg:w="5"/><text x="14.7859%" y="287.50"></text></g><g><title>rust-playground`&lt;crossbeam_utils::cache_padded::CachePadded&lt;T&gt; as core::ops::deref::Deref&gt;::deref (2 samples, 0.12%)</title><rect x="14.8278%" y="277" width="0.1168%" height="15" fill="rgb(226,26,5)" fg:x="254" fg:w="2"/><text x="15.0778%" y="287.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::get (4 samples, 0.23%)</title><rect x="14.9445%" y="277" width="0.2335%" height="15" fill="rgb(249,33,26)" fg:x="256" fg:w="4"/><text x="15.1945%" y="287.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::new (2 samples, 0.12%)</title><rect x="15.1781%" y="277" width="0.1168%" height="15" fill="rgb(235,183,28)" fg:x="260" fg:w="2"/><text x="15.4281%" y="287.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::set (2 samples, 0.12%)</title><rect x="15.2948%" y="277" width="0.1168%" height="15" fill="rgb(221,5,38)" fg:x="262" fg:w="2"/><text x="15.5448%" y="287.50"></text></g><g><title>rust-playground`core::ptr::const_ptr::_&lt;impl *const T&gt;::is_null (7 samples, 0.41%)</title><rect x="15.4116%" y="277" width="0.4086%" height="15" fill="rgb(247,18,42)" fg:x="264" fg:w="7"/><text x="15.6616%" y="287.50"></text></g><g><title>rust-playground`core::result::Result&lt;T,E&gt;::map_err (4 samples, 0.23%)</title><rect x="15.8202%" y="277" width="0.2335%" height="15" fill="rgb(241,131,45)" fg:x="271" fg:w="4"/><text x="16.0702%" y="287.50"></text></g><g><title>rust-playground`core::sync::atomic::spin_loop_hint (46 samples, 2.69%)</title><rect x="16.0537%" y="277" width="2.6853%" height="15" fill="rgb(249,31,29)" fg:x="275" fg:w="46"/><text x="16.3037%" y="287.50">ru..</text></g><g><title>rust-playground`crossbeam_channel::context::Context::reset (1 samples, 0.06%)</title><rect x="18.7391%" y="229" width="0.0584%" height="15" fill="rgb(225,111,53)" fg:x="321" fg:w="1"/><text x="18.9891%" y="239.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::store (1 samples, 0.06%)</title><rect x="18.7391%" y="213" width="0.0584%" height="15" fill="rgb(238,160,17)" fg:x="321" fg:w="1"/><text x="18.9891%" y="223.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_store (1 samples, 0.06%)</title><rect x="18.7391%" y="197" width="0.0584%" height="15" fill="rgb(214,148,48)" fg:x="321" fg:w="1"/><text x="18.9891%" y="207.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::load (4 samples, 0.23%)</title><rect x="18.8558%" y="181" width="0.2335%" height="15" fill="rgb(232,36,49)" fg:x="323" fg:w="4"/><text x="19.1058%" y="191.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_load (3 samples, 0.18%)</title><rect x="18.9142%" y="165" width="0.1751%" height="15" fill="rgb(209,103,24)" fg:x="324" fg:w="3"/><text x="19.1642%" y="175.50"></text></g><g><title>rust-playground`core::sync::atomic::spin_loop_hint (2 samples, 0.12%)</title><rect x="19.0893%" y="181" width="0.1168%" height="15" fill="rgb(229,88,8)" fg:x="327" fg:w="2"/><text x="19.3393%" y="191.50"></text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::is_completed (1 samples, 0.06%)</title><rect x="19.2061%" y="181" width="0.0584%" height="15" fill="rgb(213,181,19)" fg:x="329" fg:w="1"/><text x="19.4561%" y="191.50"></text></g><g><title>rust-playground`&lt;core::ops::range::Range&lt;T&gt; as core::iter::range::RangeIteratorImpl&gt;::spec_next (3 samples, 0.18%)</title><rect x="19.2644%" y="149" width="0.1751%" height="15" fill="rgb(254,191,54)" fg:x="330" fg:w="3"/><text x="19.5144%" y="159.50"></text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::snooze (4 samples, 0.23%)</title><rect x="19.2644%" y="181" width="0.2335%" height="15" fill="rgb(241,83,37)" fg:x="330" fg:w="4"/><text x="19.5144%" y="191.50"></text></g><g><title>rust-playground`core::iter::range::_&lt;impl core::iter::traits::iterator::Iterator for core::ops::range::Range&lt;A&gt;&gt;::next (4 samples, 0.23%)</title><rect x="19.2644%" y="165" width="0.2335%" height="15" fill="rgb(233,36,39)" fg:x="330" fg:w="4"/><text x="19.5144%" y="175.50"></text></g><g><title>rust-playground`core::mem::replace (1 samples, 0.06%)</title><rect x="19.4396%" y="149" width="0.0584%" height="15" fill="rgb(226,3,54)" fg:x="333" fg:w="1"/><text x="19.6896%" y="159.50"></text></g><g><title>rust-playground`crossbeam_channel::context::Context::with (20 samples, 1.17%)</title><rect x="18.7391%" y="277" width="1.1675%" height="15" fill="rgb(245,192,40)" fg:x="321" fg:w="20"/><text x="18.9891%" y="287.50"></text></g><g><title>rust-playground`std::thread::local::LocalKey&lt;T&gt;::try_with (20 samples, 1.17%)</title><rect x="18.7391%" y="261" width="1.1675%" height="15" fill="rgb(238,167,29)" fg:x="321" fg:w="20"/><text x="18.9891%" y="271.50"></text></g><g><title>rust-playground`crossbeam_channel::context::Context::with::_{{closure}} (20 samples, 1.17%)</title><rect x="18.7391%" y="245" width="1.1675%" height="15" fill="rgb(232,182,51)" fg:x="321" fg:w="20"/><text x="18.9891%" y="255.50"></text></g><g><title>rust-playground`crossbeam_channel::context::Context::with::_{{closure}} (19 samples, 1.11%)</title><rect x="18.7974%" y="229" width="1.1092%" height="15" fill="rgb(231,60,39)" fg:x="322" fg:w="19"/><text x="19.0474%" y="239.50"></text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::recv::_{{closure}} (18 samples, 1.05%)</title><rect x="18.8558%" y="213" width="1.0508%" height="15" fill="rgb(208,69,12)" fg:x="323" fg:w="18"/><text x="19.1058%" y="223.50"></text></g><g><title>rust-playground`crossbeam_channel::context::Context::wait_until (18 samples, 1.05%)</title><rect x="18.8558%" y="197" width="1.0508%" height="15" fill="rgb(235,93,37)" fg:x="323" fg:w="18"/><text x="19.1058%" y="207.50"></text></g><g><title>rust-playground`std::thread::park (7 samples, 0.41%)</title><rect x="19.4980%" y="181" width="0.4086%" height="15" fill="rgb(213,116,39)" fg:x="334" fg:w="7"/><text x="19.7480%" y="191.50"></text></g><g><title>libsystem_kernel.dylib`__psynch_cvwait (6 samples, 0.35%)</title><rect x="19.5563%" y="165" width="0.3503%" height="15" fill="rgb(222,207,29)" fg:x="335" fg:w="6"/><text x="19.8063%" y="175.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::store (40 samples, 2.34%)</title><rect x="20.3152%" y="261" width="2.3351%" height="15" fill="rgb(206,96,30)" fg:x="348" fg:w="40"/><text x="20.5652%" y="271.50">r..</text></g><g><title>rust-playground`core::sync::atomic::atomic_store (40 samples, 2.34%)</title><rect x="20.3152%" y="245" width="2.3351%" height="15" fill="rgb(218,138,4)" fg:x="348" fg:w="40"/><text x="20.5652%" y="255.50">r..</text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::read (48 samples, 2.80%)</title><rect x="19.9066%" y="277" width="2.8021%" height="15" fill="rgb(250,191,14)" fg:x="341" fg:w="48"/><text x="20.1566%" y="287.50">ru..</text></g><g><title>rust-playground`crossbeam_channel::waker::SyncWaker::notify (1 samples, 0.06%)</title><rect x="22.6503%" y="261" width="0.0584%" height="15" fill="rgb(239,60,40)" fg:x="388" fg:w="1"/><text x="22.9003%" y="271.50"></text></g><g><title>rust-playground`&lt;usize as core::slice::index::SliceIndex&lt;[T]&gt;&gt;::get_unchecked (22 samples, 1.28%)</title><rect x="27.2037%" y="261" width="1.2843%" height="15" fill="rgb(206,27,48)" fg:x="466" fg:w="22"/><text x="27.4537%" y="271.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::new (2 samples, 0.12%)</title><rect x="28.4880%" y="261" width="0.1168%" height="15" fill="rgb(225,35,8)" fg:x="488" fg:w="2"/><text x="28.7380%" y="271.50"></text></g><g><title>rust-playground`core::slice::_&lt;impl [T]&gt;::get_unchecked (7 samples, 0.41%)</title><rect x="28.6048%" y="261" width="0.4086%" height="15" fill="rgb(250,213,24)" fg:x="490" fg:w="7"/><text x="28.8548%" y="271.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::compare_exchange_weak (10 samples, 0.58%)</title><rect x="29.0134%" y="261" width="0.5838%" height="15" fill="rgb(247,123,22)" fg:x="497" fg:w="10"/><text x="29.2634%" y="271.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_compare_exchange_weak (9 samples, 0.53%)</title><rect x="29.0718%" y="245" width="0.5254%" height="15" fill="rgb(231,138,38)" fg:x="498" fg:w="9"/><text x="29.3218%" y="255.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::load (106 samples, 6.19%)</title><rect x="29.5972%" y="261" width="6.1880%" height="15" fill="rgb(231,145,46)" fg:x="507" fg:w="106"/><text x="29.8472%" y="271.50">rust-pla..</text></g><g><title>rust-playground`core::sync::atomic::atomic_load (94 samples, 5.49%)</title><rect x="30.2977%" y="245" width="5.4874%" height="15" fill="rgb(251,118,11)" fg:x="519" fg:w="94"/><text x="30.5477%" y="255.50">rust-pl..</text></g><g><title>rust-playground`core::sync::atomic::atomic_compare_exchange_weak (1 samples, 0.06%)</title><rect x="35.7852%" y="261" width="0.0584%" height="15" fill="rgb(217,147,25)" fg:x="613" fg:w="1"/><text x="36.0352%" y="271.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_load (1 samples, 0.06%)</title><rect x="35.8435%" y="261" width="0.0584%" height="15" fill="rgb(247,81,37)" fg:x="614" fg:w="1"/><text x="36.0935%" y="271.50"></text></g><g><title>rust-playground`core::sync::atomic::fence (3 samples, 0.18%)</title><rect x="35.9019%" y="261" width="0.1751%" height="15" fill="rgb(209,12,38)" fg:x="615" fg:w="3"/><text x="36.1519%" y="271.50"></text></g><g><title>rust-playground`core::sync::atomic::spin_loop_hint (5 samples, 0.29%)</title><rect x="36.0771%" y="261" width="0.2919%" height="15" fill="rgb(227,1,9)" fg:x="618" fg:w="5"/><text x="36.3271%" y="271.50"></text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::new (3 samples, 0.18%)</title><rect x="36.3689%" y="261" width="0.1751%" height="15" fill="rgb(248,47,43)" fg:x="623" fg:w="3"/><text x="36.6189%" y="271.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::set (2 samples, 0.12%)</title><rect x="36.7192%" y="245" width="0.1168%" height="15" fill="rgb(221,10,30)" fg:x="629" fg:w="2"/><text x="36.9692%" y="255.50"></text></g><g><title>rust-playground`core::mem::replace (1 samples, 0.06%)</title><rect x="36.7776%" y="229" width="0.0584%" height="15" fill="rgb(210,229,1)" fg:x="630" fg:w="1"/><text x="37.0276%" y="239.50"></text></g><g><title>rust-playground`core::cmp::Ord::min (1 samples, 0.06%)</title><rect x="36.8360%" y="245" width="0.0584%" height="15" fill="rgb(222,148,37)" fg:x="631" fg:w="1"/><text x="37.0860%" y="255.50"></text></g><g><title>rust-playground`core::cmp::impls::_&lt;impl core::cmp::Ord for u32&gt;::cmp (2 samples, 0.12%)</title><rect x="36.8943%" y="245" width="0.1168%" height="15" fill="rgb(234,67,33)" fg:x="632" fg:w="2"/><text x="37.1443%" y="255.50"></text></g><g><title>rust-playground`&lt;core::ops::range::Range&lt;T&gt; as core::iter::range::RangeIteratorImpl&gt;::spec_next (3 samples, 0.18%)</title><rect x="37.0111%" y="229" width="0.1751%" height="15" fill="rgb(247,98,35)" fg:x="634" fg:w="3"/><text x="37.2611%" y="239.50"></text></g><g><title>rust-playground`&lt;i32 as core::iter::range::Step&gt;::forward_unchecked (1 samples, 0.06%)</title><rect x="37.1862%" y="229" width="0.0584%" height="15" fill="rgb(247,138,52)" fg:x="637" fg:w="1"/><text x="37.4362%" y="239.50"></text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::start_recv (250 samples, 14.59%)</title><rect x="22.7087%" y="277" width="14.5943%" height="15" fill="rgb(213,79,30)" fg:x="389" fg:w="250"/><text x="22.9587%" y="287.50">rust-playground`crossb..</text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::spin (13 samples, 0.76%)</title><rect x="36.5441%" y="261" width="0.7589%" height="15" fill="rgb(246,177,23)" fg:x="626" fg:w="13"/><text x="36.7941%" y="271.50"></text></g><g><title>rust-playground`core::iter::range::_&lt;impl core::iter::traits::iterator::Iterator for core::ops::range::Range&lt;A&gt;&gt;::next (5 samples, 0.29%)</title><rect x="37.0111%" y="245" width="0.2919%" height="15" fill="rgb(230,62,27)" fg:x="634" fg:w="5"/><text x="37.2611%" y="255.50"></text></g><g><title>rust-playground`core::cmp::impls::_&lt;impl core::cmp::PartialOrd for i32&gt;::lt (1 samples, 0.06%)</title><rect x="37.2446%" y="229" width="0.0584%" height="15" fill="rgb(216,154,8)" fg:x="638" fg:w="1"/><text x="37.4946%" y="239.50"></text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::is_completed (1 samples, 0.06%)</title><rect x="37.3030%" y="277" width="0.0584%" height="15" fill="rgb(244,35,45)" fg:x="639" fg:w="1"/><text x="37.5530%" y="287.50"></text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::new (2 samples, 0.12%)</title><rect x="37.3614%" y="277" width="0.1168%" height="15" fill="rgb(251,115,12)" fg:x="640" fg:w="2"/><text x="37.6114%" y="287.50"></text></g><g><title>libsystem_kernel.dylib`swtch_pri (12 samples, 0.70%)</title><rect x="40.5721%" y="261" width="0.7005%" height="15" fill="rgb(240,54,50)" fg:x="695" fg:w="12"/><text x="40.8221%" y="271.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::replace (6 samples, 0.35%)</title><rect x="41.7980%" y="245" width="0.3503%" height="15" fill="rgb(233,84,52)" fg:x="716" fg:w="6"/><text x="42.0480%" y="255.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::set (29 samples, 1.69%)</title><rect x="41.2726%" y="261" width="1.6929%" height="15" fill="rgb(207,117,47)" fg:x="707" fg:w="29"/><text x="41.5226%" y="271.50"></text></g><g><title>rust-playground`core::mem::replace (14 samples, 0.82%)</title><rect x="42.1483%" y="245" width="0.8173%" height="15" fill="rgb(249,43,39)" fg:x="722" fg:w="14"/><text x="42.3983%" y="255.50"></text></g><g><title>rust-playground`&lt;core::ops::range::Range&lt;T&gt; as core::iter::range::RangeIteratorImpl&gt;::spec_next (83 samples, 4.85%)</title><rect x="43.9580%" y="245" width="4.8453%" height="15" fill="rgb(209,38,44)" fg:x="753" fg:w="83"/><text x="44.2080%" y="255.50">rust-p..</text></g><g><title>rust-playground`&lt;i32 as core::iter::range::Step&gt;::forward_unchecked (20 samples, 1.17%)</title><rect x="48.8033%" y="245" width="1.1675%" height="15" fill="rgb(236,212,23)" fg:x="836" fg:w="20"/><text x="49.0533%" y="255.50"></text></g><g><title>rust-playground`core::clone::impls::_&lt;impl core::clone::Clone for i32&gt;::clone (1 samples, 0.06%)</title><rect x="49.9708%" y="245" width="0.0584%" height="15" fill="rgb(242,79,21)" fg:x="856" fg:w="1"/><text x="50.2208%" y="255.50"></text></g><g><title>rust-playground`core::cmp::impls::_&lt;impl core::cmp::PartialOrd for i32&gt;::lt (4 samples, 0.23%)</title><rect x="50.0292%" y="245" width="0.2335%" height="15" fill="rgb(211,96,35)" fg:x="857" fg:w="4"/><text x="50.2792%" y="255.50"></text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::recv (652 samples, 38.06%)</title><rect x="13.1932%" y="293" width="38.0619%" height="15" fill="rgb(253,215,40)" fg:x="226" fg:w="652"/><text x="13.4432%" y="303.50">rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;:..</text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::snooze (236 samples, 13.78%)</title><rect x="37.4781%" y="277" width="13.7770%" height="15" fill="rgb(211,81,21)" fg:x="642" fg:w="236"/><text x="37.7281%" y="287.50">rust-playground`cross..</text></g><g><title>rust-playground`core::iter::range::_&lt;impl core::iter::traits::iterator::Iterator for core::ops::range::Range&lt;A&gt;&gt;::next (142 samples, 8.29%)</title><rect x="42.9656%" y="261" width="8.2896%" height="15" fill="rgb(208,190,38)" fg:x="736" fg:w="142"/><text x="43.2156%" y="271.50">rust-playgro..</text></g><g><title>rust-playground`core::mem::replace (17 samples, 0.99%)</title><rect x="50.2627%" y="245" width="0.9924%" height="15" fill="rgb(235,213,38)" fg:x="861" fg:w="17"/><text x="50.5127%" y="255.50"></text></g><g><title>rust-playground`crossbeam_channel::channel::Receiver&lt;T&gt;::recv (667 samples, 38.94%)</title><rect x="12.3759%" y="309" width="38.9375%" height="15" fill="rgb(237,122,38)" fg:x="212" fg:w="667"/><text x="12.6259%" y="319.50">rust-playground`crossbeam_channel::channel::Receiver&lt;T&gt;::recv</text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::start_recv (1 samples, 0.06%)</title><rect x="51.2551%" y="293" width="0.0584%" height="15" fill="rgb(244,218,35)" fg:x="878" fg:w="1"/><text x="51.5051%" y="303.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::counter::Sender&lt;C&gt; as core::ops::deref::Deref&gt;::deref (2 samples, 0.12%)</title><rect x="51.7805%" y="293" width="0.1168%" height="15" fill="rgb(240,68,47)" fg:x="887" fg:w="2"/><text x="52.0305%" y="303.50"></text></g><g><title>rust-playground`core::result::Result&lt;T,E&gt;::map_err (1 samples, 0.06%)</title><rect x="51.8973%" y="293" width="0.0584%" height="15" fill="rgb(210,16,53)" fg:x="889" fg:w="1"/><text x="52.1473%" y="303.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::flavors::array::ArrayToken as core::default::Default&gt;::default (8 samples, 0.47%)</title><rect x="52.1308%" y="277" width="0.4670%" height="15" fill="rgb(235,124,12)" fg:x="893" fg:w="8"/><text x="52.3808%" y="287.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::flavors::list::ListToken as core::default::Default&gt;::default (5 samples, 0.29%)</title><rect x="52.5978%" y="277" width="0.2919%" height="15" fill="rgb(224,169,11)" fg:x="901" fg:w="5"/><text x="52.8478%" y="287.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::flavors::zero::ZeroToken as core::default::Default&gt;::default (4 samples, 0.23%)</title><rect x="52.8897%" y="277" width="0.2335%" height="15" fill="rgb(250,166,2)" fg:x="906" fg:w="4"/><text x="53.1397%" y="287.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::select::Token as core::default::Default&gt;::default (4 samples, 0.23%)</title><rect x="53.1232%" y="277" width="0.2335%" height="15" fill="rgb(242,216,29)" fg:x="910" fg:w="4"/><text x="53.3732%" y="287.50"></text></g><g><title>rust-playground`core::ptr::const_ptr::_&lt;impl *const T&gt;::is_null (41 samples, 2.39%)</title><rect x="53.3567%" y="277" width="2.3935%" height="15" fill="rgb(230,116,27)" fg:x="914" fg:w="41"/><text x="53.6067%" y="287.50">ru..</text></g><g><title>rust-playground`&lt;usize as core::slice::index::SliceIndex&lt;[T]&gt;&gt;::get_unchecked (2 samples, 0.12%)</title><rect x="56.8009%" y="261" width="0.1168%" height="15" fill="rgb(228,99,48)" fg:x="973" fg:w="2"/><text x="57.0509%" y="271.50"></text></g><g><title>rust-playground`core::slice::_&lt;impl [T]&gt;::get_unchecked (1 samples, 0.06%)</title><rect x="56.9177%" y="261" width="0.0584%" height="15" fill="rgb(253,11,6)" fg:x="975" fg:w="1"/><text x="57.1677%" y="271.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::compare_exchange_weak (12 samples, 0.70%)</title><rect x="56.9761%" y="261" width="0.7005%" height="15" fill="rgb(247,143,39)" fg:x="976" fg:w="12"/><text x="57.2261%" y="271.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_compare_exchange_weak (7 samples, 0.41%)</title><rect x="57.2680%" y="245" width="0.4086%" height="15" fill="rgb(236,97,10)" fg:x="981" fg:w="7"/><text x="57.5180%" y="255.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::load (31 samples, 1.81%)</title><rect x="57.6766%" y="261" width="1.8097%" height="15" fill="rgb(233,208,19)" fg:x="988" fg:w="31"/><text x="57.9266%" y="271.50">r..</text></g><g><title>rust-playground`core::sync::atomic::atomic_load (29 samples, 1.69%)</title><rect x="57.7933%" y="245" width="1.6929%" height="15" fill="rgb(216,164,2)" fg:x="990" fg:w="29"/><text x="58.0433%" y="255.50"></text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::start_send (65 samples, 3.79%)</title><rect x="55.7501%" y="277" width="3.7945%" height="15" fill="rgb(220,129,5)" fg:x="955" fg:w="65"/><text x="56.0001%" y="287.50">rust..</text></g><g><title>rust-playground`core::sync::atomic::atomic_load (1 samples, 0.06%)</title><rect x="59.4863%" y="261" width="0.0584%" height="15" fill="rgb(242,17,10)" fg:x="1019" fg:w="1"/><text x="59.7363%" y="271.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::store (38 samples, 2.22%)</title><rect x="60.0117%" y="261" width="2.2183%" height="15" fill="rgb(242,107,0)" fg:x="1028" fg:w="38"/><text x="60.2617%" y="271.50">r..</text></g><g><title>rust-playground`core::sync::atomic::atomic_store (38 samples, 2.22%)</title><rect x="60.0117%" y="245" width="2.2183%" height="15" fill="rgb(251,28,31)" fg:x="1028" fg:w="38"/><text x="60.2617%" y="255.50">r..</text></g><g><title>rust-playground`alloc::vec::Vec&lt;T,A&gt;::drain (1 samples, 0.06%)</title><rect x="62.3468%" y="245" width="0.0584%" height="15" fill="rgb(233,223,10)" fg:x="1068" fg:w="1"/><text x="62.5968%" y="255.50"></text></g><g><title>libsystem_pthread.dylib`_pthread_mutex_firstfit_unlock_slow (1 samples, 0.06%)</title><rect x="62.4051%" y="213" width="0.0584%" height="15" fill="rgb(215,21,27)" fg:x="1069" fg:w="1"/><text x="62.6551%" y="223.50"></text></g><g><title>libsystem_kernel.dylib`__psynch_mutexdrop (1 samples, 0.06%)</title><rect x="62.4051%" y="197" width="0.0584%" height="15" fill="rgb(232,23,21)" fg:x="1069" fg:w="1"/><text x="62.6551%" y="207.50"></text></g><g><title>rust-playground`core::ptr::drop_in_place&lt;std::sync::mutex::MutexGuard&lt;crossbeam_channel::waker::Waker&gt;&gt; (2 samples, 0.12%)</title><rect x="62.4051%" y="245" width="0.1168%" height="15" fill="rgb(244,5,23)" fg:x="1069" fg:w="2"/><text x="62.6551%" y="255.50"></text></g><g><title>rust-playground`&lt;std::sync::mutex::MutexGuard&lt;T&gt; as core::ops::drop::Drop&gt;::drop (2 samples, 0.12%)</title><rect x="62.4051%" y="229" width="0.1168%" height="15" fill="rgb(226,81,46)" fg:x="1069" fg:w="2"/><text x="62.6551%" y="239.50"></text></g><g><title>rust-playground`std::sync::poison::Flag::done (1 samples, 0.06%)</title><rect x="62.4635%" y="213" width="0.0584%" height="15" fill="rgb(247,70,30)" fg:x="1070" fg:w="1"/><text x="62.7135%" y="223.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_load (1 samples, 0.06%)</title><rect x="62.4635%" y="197" width="0.0584%" height="15" fill="rgb(212,68,19)" fg:x="1070" fg:w="1"/><text x="62.7135%" y="207.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicBool::load (7 samples, 0.41%)</title><rect x="62.5219%" y="245" width="0.4086%" height="15" fill="rgb(240,187,13)" fg:x="1071" fg:w="7"/><text x="62.7719%" y="255.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_load (6 samples, 0.35%)</title><rect x="62.5803%" y="229" width="0.3503%" height="15" fill="rgb(223,113,26)" fg:x="1072" fg:w="6"/><text x="62.8303%" y="239.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicBool::store (1 samples, 0.06%)</title><rect x="62.9305%" y="245" width="0.0584%" height="15" fill="rgb(206,192,2)" fg:x="1078" fg:w="1"/><text x="63.1805%" y="255.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_store (1 samples, 0.06%)</title><rect x="62.9305%" y="229" width="0.0584%" height="15" fill="rgb(241,108,4)" fg:x="1078" fg:w="1"/><text x="63.1805%" y="239.50"></text></g><g><title>rust-playground`&lt;alloc::vec::drain::Drain&lt;T,A&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.06%)</title><rect x="62.9889%" y="229" width="0.0584%" height="15" fill="rgb(247,173,49)" fg:x="1079" fg:w="1"/><text x="63.2389%" y="239.50"></text></g><g><title>rust-playground`&lt;core::slice::iter::Iter&lt;T&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.06%)</title><rect x="62.9889%" y="213" width="0.0584%" height="15" fill="rgb(224,114,35)" fg:x="1079" fg:w="1"/><text x="63.2389%" y="223.50"></text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::guaranteed_eq (1 samples, 0.06%)</title><rect x="62.9889%" y="197" width="0.0584%" height="15" fill="rgb(245,159,27)" fg:x="1079" fg:w="1"/><text x="63.2389%" y="207.50"></text></g><g><title>rust-playground`alloc::vec::Vec&lt;T,A&gt;::drain (1 samples, 0.06%)</title><rect x="63.0473%" y="229" width="0.0584%" height="15" fill="rgb(245,172,44)" fg:x="1080" fg:w="1"/><text x="63.2973%" y="239.50"></text></g><g><title>rust-playground`core::ptr::drop_in_place&lt;alloc::vec::drain::Drain&lt;crossbeam_channel::waker::Entry&gt;&gt; (1 samples, 0.06%)</title><rect x="63.1057%" y="229" width="0.0584%" height="15" fill="rgb(236,23,11)" fg:x="1081" fg:w="1"/><text x="63.3557%" y="239.50"></text></g><g><title>rust-playground`&lt;alloc::vec::drain::Drain&lt;T,A&gt; as core::ops::drop::Drop&gt;::drop (1 samples, 0.06%)</title><rect x="63.1057%" y="213" width="0.0584%" height="15" fill="rgb(205,117,38)" fg:x="1081" fg:w="1"/><text x="63.3557%" y="223.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::Waker::notify (4 samples, 0.23%)</title><rect x="62.9889%" y="245" width="0.2335%" height="15" fill="rgb(237,72,25)" fg:x="1079" fg:w="4"/><text x="63.2389%" y="255.50"></text></g><g><title>rust-playground`core::slice::index::range (1 samples, 0.06%)</title><rect x="63.1640%" y="229" width="0.0584%" height="15" fill="rgb(244,70,9)" fg:x="1082" fg:w="1"/><text x="63.4140%" y="239.50"></text></g><g><title>rust-playground`&lt;core::slice::iter::Iter&lt;T&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.06%)</title><rect x="63.2808%" y="213" width="0.0584%" height="15" fill="rgb(217,125,39)" fg:x="1084" fg:w="1"/><text x="63.5308%" y="223.50"></text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::guaranteed_eq (1 samples, 0.06%)</title><rect x="63.2808%" y="197" width="0.0584%" height="15" fill="rgb(235,36,10)" fg:x="1084" fg:w="1"/><text x="63.5308%" y="207.50"></text></g><g><title>rust-playground`crossbeam_channel::context::Context::thread_id (1 samples, 0.06%)</title><rect x="63.3392%" y="197" width="0.0584%" height="15" fill="rgb(251,123,47)" fg:x="1085" fg:w="1"/><text x="63.5892%" y="207.50"></text></g><g><title>libsystem_pthread.dylib`pthread_cond_signal (1 samples, 0.06%)</title><rect x="63.3975%" y="181" width="0.0584%" height="15" fill="rgb(221,13,13)" fg:x="1086" fg:w="1"/><text x="63.6475%" y="191.50"></text></g><g><title>libsystem_kernel.dylib`__psynch_cvsignal (17 samples, 0.99%)</title><rect x="63.4559%" y="165" width="0.9924%" height="15" fill="rgb(238,131,9)" fg:x="1087" fg:w="17"/><text x="63.7059%" y="175.50"></text></g><g><title>rust-playground`&lt;core::slice::iter::Iter&lt;T&gt; as core::iter::traits::iterator::Iterator&gt;::position (22 samples, 1.28%)</title><rect x="63.2224%" y="229" width="1.2843%" height="15" fill="rgb(211,50,8)" fg:x="1083" fg:w="22"/><text x="63.4724%" y="239.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::Waker::try_select::_{{closure}} (20 samples, 1.17%)</title><rect x="63.3392%" y="213" width="1.1675%" height="15" fill="rgb(245,182,24)" fg:x="1085" fg:w="20"/><text x="63.5892%" y="223.50"></text></g><g><title>rust-playground`crossbeam_channel::context::Context::unpark (19 samples, 1.11%)</title><rect x="63.3975%" y="197" width="1.1092%" height="15" fill="rgb(242,14,37)" fg:x="1086" fg:w="19"/><text x="63.6475%" y="207.50"></text></g><g><title>rust-playground`std::thread::Thread::unpark (18 samples, 1.05%)</title><rect x="63.4559%" y="181" width="1.0508%" height="15" fill="rgb(246,228,12)" fg:x="1087" fg:w="18"/><text x="63.7059%" y="191.50"></text></g><g><title>rust-playground`std::sys::unix::thread_parker::pthread::Parker::unpark (1 samples, 0.06%)</title><rect x="64.4483%" y="165" width="0.0584%" height="15" fill="rgb(213,55,15)" fg:x="1104" fg:w="1"/><text x="64.6983%" y="175.50"></text></g><g><title>libsystem_pthread.dylib`pthread_mutex_unlock (1 samples, 0.06%)</title><rect x="64.4483%" y="149" width="0.0584%" height="15" fill="rgb(209,9,3)" fg:x="1104" fg:w="1"/><text x="64.6983%" y="159.50"></text></g><g><title>rust-playground`core::option::Option&lt;T&gt;::map (2 samples, 0.12%)</title><rect x="64.5067%" y="229" width="0.1168%" height="15" fill="rgb(230,59,30)" fg:x="1105" fg:w="2"/><text x="64.7567%" y="239.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::Waker::try_select::_{{closure}} (2 samples, 0.12%)</title><rect x="64.5067%" y="213" width="0.1168%" height="15" fill="rgb(209,121,21)" fg:x="1105" fg:w="2"/><text x="64.7567%" y="223.50"></text></g><g><title>rust-playground`alloc::vec::Vec&lt;T,A&gt;::remove (1 samples, 0.06%)</title><rect x="64.5651%" y="197" width="0.0584%" height="15" fill="rgb(220,109,13)" fg:x="1106" fg:w="1"/><text x="64.8151%" y="207.50"></text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::guaranteed_eq (1 samples, 0.06%)</title><rect x="64.5651%" y="181" width="0.0584%" height="15" fill="rgb(232,18,1)" fg:x="1106" fg:w="1"/><text x="64.8151%" y="191.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::Waker::try_select (25 samples, 1.46%)</title><rect x="63.2224%" y="245" width="1.4594%" height="15" fill="rgb(215,41,42)" fg:x="1083" fg:w="25"/><text x="63.4724%" y="255.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::current_thread_id (1 samples, 0.06%)</title><rect x="64.6235%" y="229" width="0.0584%" height="15" fill="rgb(224,123,36)" fg:x="1107" fg:w="1"/><text x="64.8735%" y="239.50"></text></g><g><title>rust-playground`std::thread::local::LocalKey&lt;T&gt;::try_with (1 samples, 0.06%)</title><rect x="64.6235%" y="213" width="0.0584%" height="15" fill="rgb(240,125,3)" fg:x="1107" fg:w="1"/><text x="64.8735%" y="223.50"></text></g><g><title>libdyld.dylib`tlv_get_addr (1 samples, 0.06%)</title><rect x="64.6235%" y="197" width="0.0584%" height="15" fill="rgb(205,98,50)" fg:x="1107" fg:w="1"/><text x="64.8735%" y="207.50"></text></g><g><title>libsystem_pthread.dylib`_pthread_mutex_firstfit_lock_slow (1 samples, 0.06%)</title><rect x="64.6818%" y="229" width="0.0584%" height="15" fill="rgb(205,185,37)" fg:x="1108" fg:w="1"/><text x="64.9318%" y="239.50"></text></g><g><title>libsystem_kernel.dylib`__psynch_mutexwait (1 samples, 0.06%)</title><rect x="64.6818%" y="213" width="0.0584%" height="15" fill="rgb(238,207,15)" fg:x="1108" fg:w="1"/><text x="64.9318%" y="223.50"></text></g><g><title>libsystem_pthread.dylib`pthread_mutex_lock (1 samples, 0.06%)</title><rect x="64.7402%" y="229" width="0.0584%" height="15" fill="rgb(213,199,42)" fg:x="1109" fg:w="1"/><text x="64.9902%" y="239.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::SyncWaker::notify (45 samples, 2.63%)</title><rect x="62.2300%" y="261" width="2.6270%" height="15" fill="rgb(235,201,11)" fg:x="1066" fg:w="45"/><text x="62.4800%" y="271.50">ru..</text></g><g><title>rust-playground`std::sync::mutex::Mutex&lt;T&gt;::lock (3 samples, 0.18%)</title><rect x="64.6818%" y="245" width="0.1751%" height="15" fill="rgb(207,46,11)" fg:x="1108" fg:w="3"/><text x="64.9318%" y="255.50"></text></g><g><title>rust-playground`std::sync::mutex::MutexGuard&lt;T&gt;::new (1 samples, 0.06%)</title><rect x="64.7986%" y="229" width="0.0584%" height="15" fill="rgb(241,35,35)" fg:x="1110" fg:w="1"/><text x="65.0486%" y="239.50"></text></g><g><title>rust-playground`std::sync::poison::Flag::guard (1 samples, 0.06%)</title><rect x="64.7986%" y="213" width="0.0584%" height="15" fill="rgb(243,32,47)" fg:x="1110" fg:w="1"/><text x="65.0486%" y="223.50"></text></g><g><title>rust-playground`crossbeam_channel::channel::Sender&lt;T&gt;::send (233 samples, 13.60%)</title><rect x="51.3135%" y="309" width="13.6019%" height="15" fill="rgb(247,202,23)" fg:x="879" fg:w="233"/><text x="51.5635%" y="319.50">rust-playground`cross..</text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::send (222 samples, 12.96%)</title><rect x="51.9556%" y="293" width="12.9597%" height="15" fill="rgb(219,102,11)" fg:x="890" fg:w="222"/><text x="52.2056%" y="303.50">rust-playground`cro..</text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::write (92 samples, 5.37%)</title><rect x="59.5447%" y="277" width="5.3707%" height="15" fill="rgb(243,110,44)" fg:x="1020" fg:w="92"/><text x="59.7947%" y="287.50">rust-pl..</text></g><g><title>rust-playground`crossbeam_channel::waker::Waker::try_select (1 samples, 0.06%)</title><rect x="64.8570%" y="261" width="0.0584%" height="15" fill="rgb(222,74,54)" fg:x="1111" fg:w="1"/><text x="65.1070%" y="271.50"></text></g><g><title>dyld`start (1,123 samples, 65.56%)</title><rect x="0.0000%" y="453" width="65.5575%" height="15" fill="rgb(216,99,12)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="463.50">dyld`start</text></g><g><title>rust-playground`main (1,123 samples, 65.56%)</title><rect x="0.0000%" y="437" width="65.5575%" height="15" fill="rgb(226,22,26)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="447.50">rust-playground`main</text></g><g><title>rust-playground`std::rt::lang_start (1,123 samples, 65.56%)</title><rect x="0.0000%" y="421" width="65.5575%" height="15" fill="rgb(217,163,10)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="431.50">rust-playground`std::rt::lang_start</text></g><g><title>rust-playground`std::rt::lang_start_internal (1,123 samples, 65.56%)</title><rect x="0.0000%" y="405" width="65.5575%" height="15" fill="rgb(213,25,53)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="415.50">rust-playground`std::rt::lang_start_internal</text></g><g><title>rust-playground`std::rt::lang_start::_{{closure}} (1,123 samples, 65.56%)</title><rect x="0.0000%" y="389" width="65.5575%" height="15" fill="rgb(252,105,26)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="399.50">rust-playground`std::rt::lang_start::_{{closure}}</text></g><g><title>rust-playground`std::sys_common::backtrace::__rust_begin_short_backtrace (1,123 samples, 65.56%)</title><rect x="0.0000%" y="373" width="65.5575%" height="15" fill="rgb(220,39,43)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="383.50">rust-playground`std::sys_common::backtrace::__rust_begin_short_backtrace</text></g><g><title>rust-playground`core::ops::function::FnOnce::call_once (1,123 samples, 65.56%)</title><rect x="0.0000%" y="357" width="65.5575%" height="15" fill="rgb(229,68,48)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="367.50">rust-playground`core::ops::function::FnOnce::call_once</text></g><g><title>rust-playground`rust_playground::main (1,123 samples, 65.56%)</title><rect x="0.0000%" y="341" width="65.5575%" height="15" fill="rgb(252,8,32)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="351.50">rust-playground`rust_playground::main</text></g><g><title>rust-playground`rust_playground::run (1,123 samples, 65.56%)</title><rect x="0.0000%" y="325" width="65.5575%" height="15" fill="rgb(223,20,43)" fg:x="0" fg:w="1123"/><text x="0.2500%" y="335.50">rust-playground`rust_playground::run</text></g><g><title>rust-playground`std::f64::_&lt;impl f64&gt;::floor (11 samples, 0.64%)</title><rect x="64.9154%" y="309" width="0.6421%" height="15" fill="rgb(229,81,49)" fg:x="1112" fg:w="11"/><text x="65.1654%" y="319.50"></text></g><g><title>rust-playground`&lt;core::slice::iter::ChunksMut&lt;T&gt; as core::iter::traits::iterator::Iterator&gt;::next (4 samples, 0.23%)</title><rect x="65.6743%" y="229" width="0.2335%" height="15" fill="rgb(236,28,36)" fg:x="1125" fg:w="4"/><text x="65.9243%" y="239.50"></text></g><g><title>rust-playground`core::cmp::impls::_&lt;impl core::cmp::Ord for usize&gt;::cmp (1 samples, 0.06%)</title><rect x="65.8494%" y="213" width="0.0584%" height="15" fill="rgb(249,185,26)" fg:x="1128" fg:w="1"/><text x="66.0994%" y="223.50"></text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::guaranteed_eq (3 samples, 0.18%)</title><rect x="66.0829%" y="213" width="0.1751%" height="15" fill="rgb(249,174,33)" fg:x="1132" fg:w="3"/><text x="66.3329%" y="223.50"></text></g><g><title>rust-playground`&lt;core::slice::iter::IterMut&lt;T&gt; as core::iter::traits::iterator::Iterator&gt;::next (9 samples, 0.53%)</title><rect x="65.9078%" y="229" width="0.5254%" height="15" fill="rgb(233,201,37)" fg:x="1129" fg:w="9"/><text x="66.1578%" y="239.50"></text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::is_null (3 samples, 0.18%)</title><rect x="66.2580%" y="213" width="0.1751%" height="15" fill="rgb(221,78,26)" fg:x="1135" fg:w="3"/><text x="66.5080%" y="223.50"></text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::guaranteed_eq (1 samples, 0.06%)</title><rect x="66.6083%" y="197" width="0.0584%" height="15" fill="rgb(250,127,30)" fg:x="1141" fg:w="1"/><text x="66.8583%" y="207.50"></text></g><g><title>rust-playground`core::slice::_&lt;impl [T]&gt;::iter_mut (14 samples, 0.82%)</title><rect x="66.4332%" y="229" width="0.8173%" height="15" fill="rgb(230,49,44)" fg:x="1138" fg:w="14"/><text x="66.6832%" y="239.50"></text></g><g><title>rust-playground`core::slice::iter::IterMut&lt;T&gt;::new (13 samples, 0.76%)</title><rect x="66.4915%" y="213" width="0.7589%" height="15" fill="rgb(229,67,23)" fg:x="1139" fg:w="13"/><text x="66.7415%" y="223.50"></text></g><g><title>rust-playground`core::ptr::mut_ptr::_&lt;impl *mut T&gt;::is_null (10 samples, 0.58%)</title><rect x="66.6667%" y="197" width="0.5838%" height="15" fill="rgb(249,83,47)" fg:x="1142" fg:w="10"/><text x="66.9167%" y="207.50"></text></g><g><title>rust-playground`dasp_sample::Sample::from_sample (15 samples, 0.88%)</title><rect x="67.2504%" y="229" width="0.8757%" height="15" fill="rgb(215,43,3)" fg:x="1152" fg:w="15"/><text x="67.5004%" y="239.50"></text></g><g><title>rust-playground`&lt;T as dasp_sample::conv::ToSample&lt;U&gt;&gt;::to_sample_ (1 samples, 0.06%)</title><rect x="68.1261%" y="213" width="0.0584%" height="15" fill="rgb(238,154,13)" fg:x="1167" fg:w="1"/><text x="68.3761%" y="223.50"></text></g><g><title>rust-playground`&lt;I as core::iter::traits::collect::IntoIterator&gt;::into_iter (1 samples, 0.06%)</title><rect x="68.6515%" y="181" width="0.0584%" height="15" fill="rgb(219,56,2)" fg:x="1176" fg:w="1"/><text x="68.9015%" y="191.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::flavors::array::ArrayToken as core::default::Default&gt;::default (12 samples, 0.70%)</title><rect x="68.7099%" y="181" width="0.7005%" height="15" fill="rgb(233,0,4)" fg:x="1177" fg:w="12"/><text x="68.9599%" y="191.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::flavors::zero::ZeroToken as core::default::Default&gt;::default (1 samples, 0.06%)</title><rect x="69.4104%" y="181" width="0.0584%" height="15" fill="rgb(235,30,7)" fg:x="1189" fg:w="1"/><text x="69.6604%" y="191.50"></text></g><g><title>rust-playground`&lt;crossbeam_utils::cache_padded::CachePadded&lt;T&gt; as core::ops::deref::Deref&gt;::deref (1 samples, 0.06%)</title><rect x="69.4688%" y="181" width="0.0584%" height="15" fill="rgb(250,79,13)" fg:x="1190" fg:w="1"/><text x="69.7188%" y="191.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::get (2 samples, 0.12%)</title><rect x="69.5271%" y="181" width="0.1168%" height="15" fill="rgb(211,146,34)" fg:x="1191" fg:w="2"/><text x="69.7771%" y="191.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::new (1 samples, 0.06%)</title><rect x="69.6439%" y="181" width="0.0584%" height="15" fill="rgb(228,22,38)" fg:x="1193" fg:w="1"/><text x="69.8939%" y="191.50"></text></g><g><title>rust-playground`core::ptr::const_ptr::_&lt;impl *const T&gt;::is_null (6 samples, 0.35%)</title><rect x="69.7023%" y="181" width="0.3503%" height="15" fill="rgb(235,168,5)" fg:x="1194" fg:w="6"/><text x="69.9523%" y="191.50"></text></g><g><title>rust-playground`core::result::Result&lt;T,E&gt;::map_err (1 samples, 0.06%)</title><rect x="70.0525%" y="181" width="0.0584%" height="15" fill="rgb(221,155,16)" fg:x="1200" fg:w="1"/><text x="70.3025%" y="191.50"></text></g><g><title>rust-playground`core::sync::atomic::spin_loop_hint (171 samples, 9.98%)</title><rect x="70.1109%" y="181" width="9.9825%" height="15" fill="rgb(215,215,53)" fg:x="1201" fg:w="171"/><text x="70.3609%" y="191.50">rust-playgroun..</text></g><g><title>libdyld.dylib`tlv_get_addr (1 samples, 0.06%)</title><rect x="80.0934%" y="149" width="0.0584%" height="15" fill="rgb(223,4,10)" fg:x="1372" fg:w="1"/><text x="80.3434%" y="159.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::set (7 samples, 0.41%)</title><rect x="80.1518%" y="133" width="0.4086%" height="15" fill="rgb(234,103,6)" fg:x="1373" fg:w="7"/><text x="80.4018%" y="143.50"></text></g><g><title>rust-playground`core::mem::replace (7 samples, 0.41%)</title><rect x="80.1518%" y="117" width="0.4086%" height="15" fill="rgb(227,97,0)" fg:x="1373" fg:w="7"/><text x="80.4018%" y="127.50"></text></g><g><title>rust-playground`&lt;std::sync::mutex::MutexGuard&lt;T&gt; as core::ops::deref::Deref&gt;::deref (1 samples, 0.06%)</title><rect x="80.6188%" y="101" width="0.0584%" height="15" fill="rgb(234,150,53)" fg:x="1381" fg:w="1"/><text x="80.8688%" y="111.50"></text></g><g><title>rust-playground`core::cmp::PartialEq::ne (1 samples, 0.06%)</title><rect x="80.7356%" y="85" width="0.0584%" height="15" fill="rgb(228,201,54)" fg:x="1383" fg:w="1"/><text x="80.9856%" y="95.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::select::Selected as core::cmp::PartialEq&gt;::eq (1 samples, 0.06%)</title><rect x="80.7356%" y="69" width="0.0584%" height="15" fill="rgb(222,22,37)" fg:x="1383" fg:w="1"/><text x="80.9856%" y="79.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::load (1 samples, 0.06%)</title><rect x="80.7939%" y="85" width="0.0584%" height="15" fill="rgb(237,53,32)" fg:x="1384" fg:w="1"/><text x="81.0439%" y="95.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_load (1 samples, 0.06%)</title><rect x="80.7939%" y="69" width="0.0584%" height="15" fill="rgb(233,25,53)" fg:x="1384" fg:w="1"/><text x="81.0439%" y="79.50"></text></g><g><title>rust-playground`core::sync::atomic::spin_loop_hint (2 samples, 0.12%)</title><rect x="80.8523%" y="85" width="0.1168%" height="15" fill="rgb(210,40,34)" fg:x="1385" fg:w="2"/><text x="81.1023%" y="95.50"></text></g><g><title>libsystem_kernel.dylib`swtch_pri (4 samples, 0.23%)</title><rect x="80.9691%" y="69" width="0.2335%" height="15" fill="rgb(241,220,44)" fg:x="1387" fg:w="4"/><text x="81.2191%" y="79.50"></text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::snooze (5 samples, 0.29%)</title><rect x="80.9691%" y="85" width="0.2919%" height="15" fill="rgb(235,28,35)" fg:x="1387" fg:w="5"/><text x="81.2191%" y="95.50"></text></g><g><title>rust-playground`core::iter::range::_&lt;impl core::iter::traits::iterator::Iterator for core::ops::range::Range&lt;A&gt;&gt;::next (1 samples, 0.06%)</title><rect x="81.2026%" y="69" width="0.0584%" height="15" fill="rgb(210,56,17)" fg:x="1391" fg:w="1"/><text x="81.4526%" y="79.50"></text></g><g><title>rust-playground`&lt;core::ops::range::Range&lt;T&gt; as core::iter::range::RangeIteratorImpl&gt;::spec_next (1 samples, 0.06%)</title><rect x="81.2026%" y="53" width="0.0584%" height="15" fill="rgb(224,130,29)" fg:x="1391" fg:w="1"/><text x="81.4526%" y="63.50"></text></g><g><title>libsystem_kernel.dylib`__psynch_cvwait (68 samples, 3.97%)</title><rect x="81.2609%" y="69" width="3.9696%" height="15" fill="rgb(235,212,8)" fg:x="1392" fg:w="68"/><text x="81.5109%" y="79.50">libs..</text></g><g><title>rust-playground`crossbeam_channel::context::Context::wait_until (79 samples, 4.61%)</title><rect x="80.6772%" y="101" width="4.6118%" height="15" fill="rgb(223,33,50)" fg:x="1382" fg:w="79"/><text x="80.9272%" y="111.50">rust-..</text></g><g><title>rust-playground`std::thread::park (69 samples, 4.03%)</title><rect x="81.2609%" y="85" width="4.0280%" height="15" fill="rgb(219,149,13)" fg:x="1392" fg:w="69"/><text x="81.5109%" y="95.50">rust..</text></g><g><title>libsystem_pthread.dylib`_pthread_cond_wait (1 samples, 0.06%)</title><rect x="85.2306%" y="69" width="0.0584%" height="15" fill="rgb(250,156,29)" fg:x="1460" fg:w="1"/><text x="85.4806%" y="79.50"></text></g><g><title>libsystem_pthread.dylib`pthread_mutex_lock (1 samples, 0.06%)</title><rect x="85.2306%" y="53" width="0.0584%" height="15" fill="rgb(216,193,19)" fg:x="1460" fg:w="1"/><text x="85.4806%" y="63.50"></text></g><g><title>rust-playground`core::ptr::drop_in_place&lt;std::sync::mutex::MutexGuard&lt;crossbeam_channel::waker::Waker&gt;&gt; (1 samples, 0.06%)</title><rect x="85.2890%" y="85" width="0.0584%" height="15" fill="rgb(216,135,14)" fg:x="1461" fg:w="1"/><text x="85.5390%" y="95.50"></text></g><g><title>rust-playground`&lt;std::sync::mutex::MutexGuard&lt;T&gt; as core::ops::drop::Drop&gt;::drop (1 samples, 0.06%)</title><rect x="85.2890%" y="69" width="0.0584%" height="15" fill="rgb(241,47,5)" fg:x="1461" fg:w="1"/><text x="85.5390%" y="79.50"></text></g><g><title>rust-playground`std::sync::poison::Flag::done (1 samples, 0.06%)</title><rect x="85.2890%" y="53" width="0.0584%" height="15" fill="rgb(233,42,35)" fg:x="1461" fg:w="1"/><text x="85.5390%" y="63.50"></text></g><g><title>rust-playground`std::panicking::panic_count::count_is_zero (1 samples, 0.06%)</title><rect x="85.2890%" y="37" width="0.0584%" height="15" fill="rgb(231,13,6)" fg:x="1461" fg:w="1"/><text x="85.5390%" y="47.50"></text></g><g><title>libsystem_pthread.dylib`_pthread_mutex_firstfit_lock_slow (2 samples, 0.12%)</title><rect x="85.3473%" y="69" width="0.1168%" height="15" fill="rgb(207,181,40)" fg:x="1462" fg:w="2"/><text x="85.5973%" y="79.50"></text></g><g><title>libsystem_kernel.dylib`__psynch_mutexwait (2 samples, 0.12%)</title><rect x="85.3473%" y="53" width="0.1168%" height="15" fill="rgb(254,173,49)" fg:x="1462" fg:w="2"/><text x="85.5973%" y="63.50"></text></g><g><title>rust-playground`crossbeam_channel::context::Context::with (93 samples, 5.43%)</title><rect x="80.0934%" y="181" width="5.4291%" height="15" fill="rgb(221,1,38)" fg:x="1372" fg:w="93"/><text x="80.3434%" y="191.50">rust-pl..</text></g><g><title>rust-playground`std::thread::local::LocalKey&lt;T&gt;::try_with (93 samples, 5.43%)</title><rect x="80.0934%" y="165" width="5.4291%" height="15" fill="rgb(206,124,46)" fg:x="1372" fg:w="93"/><text x="80.3434%" y="175.50">rust-pl..</text></g><g><title>rust-playground`crossbeam_channel::context::Context::with::_{{closure}} (92 samples, 5.37%)</title><rect x="80.1518%" y="149" width="5.3707%" height="15" fill="rgb(249,21,11)" fg:x="1373" fg:w="92"/><text x="80.4018%" y="159.50">rust-pl..</text></g><g><title>rust-playground`crossbeam_channel::context::Context::with::_{{closure}} (85 samples, 4.96%)</title><rect x="80.5604%" y="133" width="4.9621%" height="15" fill="rgb(222,201,40)" fg:x="1380" fg:w="85"/><text x="80.8104%" y="143.50">rust-p..</text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::recv::_{{closure}} (84 samples, 4.90%)</title><rect x="80.6188%" y="117" width="4.9037%" height="15" fill="rgb(235,61,29)" fg:x="1381" fg:w="84"/><text x="80.8688%" y="127.50">rust-p..</text></g><g><title>rust-playground`crossbeam_channel::waker::SyncWaker::register (4 samples, 0.23%)</title><rect x="85.2890%" y="101" width="0.2335%" height="15" fill="rgb(219,207,3)" fg:x="1461" fg:w="4"/><text x="85.5390%" y="111.50"></text></g><g><title>rust-playground`std::sync::mutex::Mutex&lt;T&gt;::lock (3 samples, 0.18%)</title><rect x="85.3473%" y="85" width="0.1751%" height="15" fill="rgb(222,56,46)" fg:x="1462" fg:w="3"/><text x="85.5973%" y="95.50"></text></g><g><title>rust-playground`std::sync::mutex::MutexGuard&lt;T&gt;::new (1 samples, 0.06%)</title><rect x="85.4641%" y="69" width="0.0584%" height="15" fill="rgb(239,76,54)" fg:x="1464" fg:w="1"/><text x="85.7141%" y="79.50"></text></g><g><title>rust-playground`std::sync::poison::Flag::guard (1 samples, 0.06%)</title><rect x="85.4641%" y="53" width="0.0584%" height="15" fill="rgb(231,124,27)" fg:x="1464" fg:w="1"/><text x="85.7141%" y="63.50"></text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::read (4 samples, 0.23%)</title><rect x="85.5225%" y="181" width="0.2335%" height="15" fill="rgb(249,195,6)" fg:x="1465" fg:w="4"/><text x="85.7725%" y="191.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::store (2 samples, 0.12%)</title><rect x="85.6392%" y="165" width="0.1168%" height="15" fill="rgb(237,174,47)" fg:x="1467" fg:w="2"/><text x="85.8892%" y="175.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_store (1 samples, 0.06%)</title><rect x="85.6976%" y="149" width="0.0584%" height="15" fill="rgb(206,201,31)" fg:x="1468" fg:w="1"/><text x="85.9476%" y="159.50"></text></g><g><title>rust-playground`&lt;usize as core::slice::index::SliceIndex&lt;[T]&gt;&gt;::get_unchecked (1 samples, 0.06%)</title><rect x="87.5657%" y="165" width="0.0584%" height="15" fill="rgb(231,57,52)" fg:x="1500" fg:w="1"/><text x="87.8157%" y="175.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::new (2 samples, 0.12%)</title><rect x="87.6241%" y="165" width="0.1168%" height="15" fill="rgb(248,177,22)" fg:x="1501" fg:w="2"/><text x="87.8741%" y="175.50"></text></g><g><title>rust-playground`core::slice::_&lt;impl [T]&gt;::get_unchecked (1 samples, 0.06%)</title><rect x="87.7408%" y="165" width="0.0584%" height="15" fill="rgb(215,211,37)" fg:x="1503" fg:w="1"/><text x="87.9908%" y="175.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::load (7 samples, 0.41%)</title><rect x="87.7992%" y="165" width="0.4086%" height="15" fill="rgb(241,128,51)" fg:x="1504" fg:w="7"/><text x="88.0492%" y="175.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_load (4 samples, 0.23%)</title><rect x="87.9743%" y="149" width="0.2335%" height="15" fill="rgb(227,165,31)" fg:x="1507" fg:w="4"/><text x="88.2243%" y="159.50"></text></g><g><title>rust-playground`core::sync::atomic::spin_loop_hint (15 samples, 0.88%)</title><rect x="88.2078%" y="165" width="0.8757%" height="15" fill="rgb(228,167,24)" fg:x="1511" fg:w="15"/><text x="88.4578%" y="175.50"></text></g><g><title>rust-playground`&lt;core::ops::range::Range&lt;T&gt; as core::iter::range::RangeIteratorImpl&gt;::spec_next (3 samples, 0.18%)</title><rect x="89.1419%" y="133" width="0.1751%" height="15" fill="rgb(228,143,12)" fg:x="1527" fg:w="3"/><text x="89.3919%" y="143.50"></text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::start_recv (62 samples, 3.62%)</title><rect x="85.7560%" y="181" width="3.6194%" height="15" fill="rgb(249,149,8)" fg:x="1469" fg:w="62"/><text x="86.0060%" y="191.50">rust..</text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::spin (5 samples, 0.29%)</title><rect x="89.0835%" y="165" width="0.2919%" height="15" fill="rgb(243,35,44)" fg:x="1526" fg:w="5"/><text x="89.3335%" y="175.50"></text></g><g><title>rust-playground`core::iter::range::_&lt;impl core::iter::traits::iterator::Iterator for core::ops::range::Range&lt;A&gt;&gt;::next (4 samples, 0.23%)</title><rect x="89.1419%" y="149" width="0.2335%" height="15" fill="rgb(246,89,9)" fg:x="1527" fg:w="4"/><text x="89.3919%" y="159.50"></text></g><g><title>rust-playground`core::mem::replace (1 samples, 0.06%)</title><rect x="89.3170%" y="133" width="0.0584%" height="15" fill="rgb(233,213,13)" fg:x="1530" fg:w="1"/><text x="89.5670%" y="143.50"></text></g><g><title>libsystem_kernel.dylib`swtch_pri (4 samples, 0.23%)</title><rect x="90.5429%" y="165" width="0.2335%" height="15" fill="rgb(233,141,41)" fg:x="1551" fg:w="4"/><text x="90.7929%" y="175.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::replace (3 samples, 0.18%)</title><rect x="91.0683%" y="149" width="0.1751%" height="15" fill="rgb(239,167,4)" fg:x="1560" fg:w="3"/><text x="91.3183%" y="159.50"></text></g><g><title>rust-playground`core::cell::Cell&lt;T&gt;::set (12 samples, 0.70%)</title><rect x="90.7764%" y="165" width="0.7005%" height="15" fill="rgb(209,217,16)" fg:x="1555" fg:w="12"/><text x="91.0264%" y="175.50"></text></g><g><title>rust-playground`core::mem::replace (4 samples, 0.23%)</title><rect x="91.2434%" y="149" width="0.2335%" height="15" fill="rgb(219,88,35)" fg:x="1563" fg:w="4"/><text x="91.4934%" y="159.50"></text></g><g><title>rust-playground`&lt;core::ops::range::Range&lt;T&gt; as core::iter::range::RangeIteratorImpl&gt;::spec_next (48 samples, 2.80%)</title><rect x="92.4694%" y="149" width="2.8021%" height="15" fill="rgb(220,193,23)" fg:x="1584" fg:w="48"/><text x="92.7194%" y="159.50">ru..</text></g><g><title>rust-playground`&lt;i32 as core::iter::range::Step&gt;::forward_unchecked (7 samples, 0.41%)</title><rect x="95.2715%" y="149" width="0.4086%" height="15" fill="rgb(230,90,52)" fg:x="1632" fg:w="7"/><text x="95.5215%" y="159.50"></text></g><g><title>rust-playground`core::clone::impls::_&lt;impl core::clone::Clone for i32&gt;::clone (4 samples, 0.23%)</title><rect x="95.6801%" y="149" width="0.2335%" height="15" fill="rgb(252,106,19)" fg:x="1639" fg:w="4"/><text x="95.9301%" y="159.50"></text></g><g><title>rust-playground`core::cmp::impls::_&lt;impl core::cmp::PartialOrd for i32&gt;::lt (5 samples, 0.29%)</title><rect x="95.9136%" y="149" width="0.2919%" height="15" fill="rgb(206,74,20)" fg:x="1643" fg:w="5"/><text x="96.1636%" y="159.50"></text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::recv (497 samples, 29.01%)</title><rect x="68.2428%" y="197" width="29.0134%" height="15" fill="rgb(230,138,44)" fg:x="1169" fg:w="497"/><text x="68.4928%" y="207.50">rust-playground`crossbeam_channel::flavors::arr..</text></g><g><title>rust-playground`crossbeam_utils::backoff::Backoff::snooze (135 samples, 7.88%)</title><rect x="89.3754%" y="181" width="7.8809%" height="15" fill="rgb(235,182,43)" fg:x="1531" fg:w="135"/><text x="89.6254%" y="191.50">rust-playgr..</text></g><g><title>rust-playground`core::iter::range::_&lt;impl core::iter::traits::iterator::Iterator for core::ops::range::Range&lt;A&gt;&gt;::next (99 samples, 5.78%)</title><rect x="91.4769%" y="165" width="5.7793%" height="15" fill="rgb(242,16,51)" fg:x="1567" fg:w="99"/><text x="91.7269%" y="175.50">rust-pl..</text></g><g><title>rust-playground`core::mem::replace (18 samples, 1.05%)</title><rect x="96.2055%" y="149" width="1.0508%" height="15" fill="rgb(248,9,4)" fg:x="1648" fg:w="18"/><text x="96.4555%" y="159.50"></text></g><g><title>rust-playground`crossbeam_channel::channel::Receiver&lt;T&gt;::recv (500 samples, 29.19%)</title><rect x="68.1845%" y="213" width="29.1886%" height="15" fill="rgb(210,31,22)" fg:x="1168" fg:w="500"/><text x="68.4345%" y="223.50">rust-playground`crossbeam_channel::channel::Rec..</text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::start_recv (2 samples, 0.12%)</title><rect x="97.2563%" y="197" width="0.1168%" height="15" fill="rgb(239,54,39)" fg:x="1666" fg:w="2"/><text x="97.5063%" y="207.50"></text></g><g><title>rust-playground`&lt;crossbeam_channel::select::Token as core::default::Default&gt;::default (1 samples, 0.06%)</title><rect x="97.5482%" y="181" width="0.0584%" height="15" fill="rgb(230,99,41)" fg:x="1671" fg:w="1"/><text x="97.7982%" y="191.50"></text></g><g><title>rust-playground`&lt;crossbeam_utils::cache_padded::CachePadded&lt;T&gt; as core::ops::deref::Deref&gt;::deref (1 samples, 0.06%)</title><rect x="97.6065%" y="181" width="0.0584%" height="15" fill="rgb(253,106,12)" fg:x="1672" fg:w="1"/><text x="97.8565%" y="191.50"></text></g><g><title>rust-playground`core::ptr::const_ptr::_&lt;impl *const T&gt;::is_null (11 samples, 0.64%)</title><rect x="97.6649%" y="181" width="0.6421%" height="15" fill="rgb(213,46,41)" fg:x="1673" fg:w="11"/><text x="97.9149%" y="191.50"></text></g><g><title>rust-playground`core::result::Result&lt;T,E&gt;::map_err (2 samples, 0.12%)</title><rect x="98.3071%" y="181" width="0.1168%" height="15" fill="rgb(215,133,35)" fg:x="1684" fg:w="2"/><text x="98.5571%" y="191.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::compare_exchange_weak (1 samples, 0.06%)</title><rect x="98.4238%" y="181" width="0.0584%" height="15" fill="rgb(213,28,5)" fg:x="1686" fg:w="1"/><text x="98.6738%" y="191.50"></text></g><g><title>rust-playground`&lt;usize as core::slice::index::SliceIndex&lt;[T]&gt;&gt;::get_unchecked (1 samples, 0.06%)</title><rect x="98.5989%" y="165" width="0.0584%" height="15" fill="rgb(215,77,49)" fg:x="1689" fg:w="1"/><text x="98.8489%" y="175.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::compare_exchange_weak (1 samples, 0.06%)</title><rect x="98.6573%" y="165" width="0.0584%" height="15" fill="rgb(248,100,22)" fg:x="1690" fg:w="1"/><text x="98.9073%" y="175.50"></text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::start_send (5 samples, 0.29%)</title><rect x="98.4822%" y="181" width="0.2919%" height="15" fill="rgb(208,67,9)" fg:x="1687" fg:w="5"/><text x="98.7322%" y="191.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_compare_exchange_weak (1 samples, 0.06%)</title><rect x="98.7157%" y="165" width="0.0584%" height="15" fill="rgb(219,133,21)" fg:x="1691" fg:w="1"/><text x="98.9657%" y="175.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicUsize::store (5 samples, 0.29%)</title><rect x="98.7741%" y="165" width="0.2919%" height="15" fill="rgb(246,46,29)" fg:x="1692" fg:w="5"/><text x="99.0241%" y="175.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_store (5 samples, 0.29%)</title><rect x="98.7741%" y="149" width="0.2919%" height="15" fill="rgb(246,185,52)" fg:x="1692" fg:w="5"/><text x="99.0241%" y="159.50"></text></g><g><title>rust-playground`core::sync::atomic::AtomicBool::load (5 samples, 0.29%)</title><rect x="99.2995%" y="149" width="0.2919%" height="15" fill="rgb(252,136,11)" fg:x="1701" fg:w="5"/><text x="99.5495%" y="159.50"></text></g><g><title>rust-playground`core::sync::atomic::atomic_load (5 samples, 0.29%)</title><rect x="99.2995%" y="133" width="0.2919%" height="15" fill="rgb(219,138,53)" fg:x="1701" fg:w="5"/><text x="99.5495%" y="143.50"></text></g><g><title>rust-playground`crossbeam_channel::channel::Sender&lt;T&gt;::send (40 samples, 2.34%)</title><rect x="97.3730%" y="213" width="2.3351%" height="15" fill="rgb(211,51,23)" fg:x="1668" fg:w="40"/><text x="97.6230%" y="223.50">r..</text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::send (39 samples, 2.28%)</title><rect x="97.4314%" y="197" width="2.2767%" height="15" fill="rgb(247,221,28)" fg:x="1669" fg:w="39"/><text x="97.6814%" y="207.50">r..</text></g><g><title>rust-playground`crossbeam_channel::flavors::array::Channel&lt;T&gt;::write (16 samples, 0.93%)</title><rect x="98.7741%" y="181" width="0.9340%" height="15" fill="rgb(251,222,45)" fg:x="1692" fg:w="16"/><text x="99.0241%" y="191.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::SyncWaker::notify (11 samples, 0.64%)</title><rect x="99.0660%" y="165" width="0.6421%" height="15" fill="rgb(217,162,53)" fg:x="1697" fg:w="11"/><text x="99.3160%" y="175.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::Waker::try_select (2 samples, 0.12%)</title><rect x="99.5914%" y="149" width="0.1168%" height="15" fill="rgb(229,93,14)" fg:x="1706" fg:w="2"/><text x="99.8414%" y="159.50"></text></g><g><title>rust-playground`&lt;core::slice::iter::Iter&lt;T&gt; as core::iter::traits::iterator::Iterator&gt;::position (2 samples, 0.12%)</title><rect x="99.5914%" y="133" width="0.1168%" height="15" fill="rgb(209,67,49)" fg:x="1706" fg:w="2"/><text x="99.8414%" y="143.50"></text></g><g><title>rust-playground`crossbeam_channel::waker::Waker::try_select::_{{closure}} (2 samples, 0.12%)</title><rect x="99.5914%" y="117" width="0.1168%" height="15" fill="rgb(213,87,29)" fg:x="1706" fg:w="2"/><text x="99.8414%" y="127.50"></text></g><g><title>rust-playground`crossbeam_channel::context::Context::unpark (2 samples, 0.12%)</title><rect x="99.5914%" y="101" width="0.1168%" height="15" fill="rgb(205,151,52)" fg:x="1706" fg:w="2"/><text x="99.8414%" y="111.50"></text></g><g><title>rust-playground`std::thread::Thread::unpark (2 samples, 0.12%)</title><rect x="99.5914%" y="85" width="0.1168%" height="15" fill="rgb(253,215,39)" fg:x="1706" fg:w="2"/><text x="99.8414%" y="95.50"></text></g><g><title>libsystem_kernel.dylib`__psynch_cvsignal (2 samples, 0.12%)</title><rect x="99.5914%" y="69" width="0.1168%" height="15" fill="rgb(221,220,41)" fg:x="1706" fg:w="2"/><text x="99.8414%" y="79.50"></text></g><g><title>CoreAudio`0x0000000104b7227c (586 samples, 34.21%)</title><rect x="65.6159%" y="373" width="34.2090%" height="15" fill="rgb(218,133,21)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="383.50">CoreAudio`0x0000000104b7227c</text></g><g><title>CoreAudio`0x0000000104c69fc4 (586 samples, 34.21%)</title><rect x="65.6159%" y="357" width="34.2090%" height="15" fill="rgb(221,193,43)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="367.50">CoreAudio`0x0000000104c69fc4</text></g><g><title>CoreAudio`0x0000000104b6e304 (586 samples, 34.21%)</title><rect x="65.6159%" y="341" width="34.2090%" height="15" fill="rgb(240,128,52)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="351.50">CoreAudio`0x0000000104b6e304</text></g><g><title>rust-playground`coreaudio::audio_unit::render_callback::input_proc (586 samples, 34.21%)</title><rect x="65.6159%" y="325" width="34.2090%" height="15" fill="rgb(253,114,12)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="335.50">rust-playground`coreaudio::audio_unit::render_callback:..</text></g><g><title>rust-playground`coreaudio::audio_unit::render_callback::_&lt;impl coreaudio::audio_unit::AudioUnit&gt;::set_render_callback::_{{closure}} (586 samples, 34.21%)</title><rect x="65.6159%" y="309" width="34.2090%" height="15" fill="rgb(215,223,47)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="319.50">rust-playground`coreaudio::audio_unit::render_callback:..</text></g><g><title>rust-playground`cpal::host::coreaudio::macos::Device::build_output_stream_raw::_{{closure}} (586 samples, 34.21%)</title><rect x="65.6159%" y="293" width="34.2090%" height="15" fill="rgb(248,225,23)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="303.50">rust-playground`cpal::host::coreaudio::macos::Device::b..</text></g><g><title>rust-playground`cpal::traits::DeviceTrait::build_output_stream::_{{closure}} (586 samples, 34.21%)</title><rect x="65.6159%" y="277" width="34.2090%" height="15" fill="rgb(250,108,0)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="287.50">rust-playground`cpal::traits::DeviceTrait::build_output..</text></g><g><title>rust-playground`rust_playground::run::_{{closure}} (586 samples, 34.21%)</title><rect x="65.6159%" y="261" width="34.2090%" height="15" fill="rgb(228,208,7)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="271.50">rust-playground`rust_playground::run::_{{closure}}</text></g><g><title>rust-playground`rust_playground::write_data (586 samples, 34.21%)</title><rect x="65.6159%" y="245" width="34.2090%" height="15" fill="rgb(244,45,10)" fg:x="1124" fg:w="586"/><text x="65.8659%" y="255.50">rust-playground`rust_playground::write_data</text></g><g><title>rust-playground`rust_playground::run::_{{closure}} (543 samples, 31.70%)</title><rect x="68.1261%" y="229" width="31.6988%" height="15" fill="rgb(207,125,25)" fg:x="1167" fg:w="543"/><text x="68.3761%" y="239.50">rust-playground`rust_playground::run::_{{closure}}</text></g><g><title>rust-playground`dasp_sample::Sample::to_sample (2 samples, 0.12%)</title><rect x="99.7081%" y="213" width="0.1168%" height="15" fill="rgb(210,195,18)" fg:x="1708" fg:w="2"/><text x="99.9581%" y="223.50"></text></g><g><title>rust-playground`&lt;T as dasp_sample::conv::ToSample&lt;U&gt;&gt;::to_sample_ (1 samples, 0.06%)</title><rect x="99.7665%" y="197" width="0.0584%" height="15" fill="rgb(249,80,12)" fg:x="1709" fg:w="1"/><text x="100.0165%" y="207.50"></text></g><g><title>rust-playground`&lt;f32 as dasp_sample::conv::FromSample&lt;f64&gt;&gt;::from_sample_ (1 samples, 0.06%)</title><rect x="99.7665%" y="181" width="0.0584%" height="15" fill="rgb(221,65,9)" fg:x="1709" fg:w="1"/><text x="100.0165%" y="191.50"></text></g><g><title>CoreAudio`HALC_ProxyIOContext::IOWorkLoop (589 samples, 34.38%)</title><rect x="65.5575%" y="389" width="34.3841%" height="15" fill="rgb(235,49,36)" fg:x="1123" fg:w="589"/><text x="65.8075%" y="399.50">CoreAudio`HALC_ProxyIOContext::IOWorkLoop</text></g><g><title>CoreAudio`HALB_MachPort::SendSimpleMessageWithSimpleReply (2 samples, 0.12%)</title><rect x="99.8249%" y="373" width="0.1168%" height="15" fill="rgb(225,32,20)" fg:x="1710" fg:w="2"/><text x="100.0749%" y="383.50"></text></g><g><title>libsystem_kernel.dylib`mach_msg (2 samples, 0.12%)</title><rect x="99.8249%" y="357" width="0.1168%" height="15" fill="rgb(215,141,46)" fg:x="1710" fg:w="2"/><text x="100.0749%" y="367.50"></text></g><g><title>libsystem_kernel.dylib`mach_msg_overwrite (2 samples, 0.12%)</title><rect x="99.8249%" y="341" width="0.1168%" height="15" fill="rgb(250,160,47)" fg:x="1710" fg:w="2"/><text x="100.0749%" y="351.50"></text></g><g><title>libsystem_kernel.dylib`mach_msg2_trap (2 samples, 0.12%)</title><rect x="99.8249%" y="325" width="0.1168%" height="15" fill="rgb(216,222,40)" fg:x="1710" fg:w="2"/><text x="100.0749%" y="335.50"></text></g><g><title>all (1,713 samples, 100%)</title><rect x="0.0000%" y="469" width="100.0000%" height="15" fill="rgb(234,217,39)" fg:x="0" fg:w="1713"/><text x="0.2500%" y="479.50"></text></g><g><title>libsystem_pthread.dylib`thread_start (590 samples, 34.44%)</title><rect x="65.5575%" y="453" width="34.4425%" height="15" fill="rgb(207,178,40)" fg:x="1123" fg:w="590"/><text x="65.8075%" y="463.50">libsystem_pthread.dylib`thread_start</text></g><g><title>libsystem_pthread.dylib`_pthread_start (590 samples, 34.44%)</title><rect x="65.5575%" y="437" width="34.4425%" height="15" fill="rgb(221,136,13)" fg:x="1123" fg:w="590"/><text x="65.8075%" y="447.50">libsystem_pthread.dylib`_pthread_start</text></g><g><title>CoreAudio`HALB_IOThread::Entry (590 samples, 34.44%)</title><rect x="65.5575%" y="421" width="34.4425%" height="15" fill="rgb(249,199,10)" fg:x="1123" fg:w="590"/><text x="65.8075%" y="431.50">CoreAudio`HALB_IOThread::Entry</text></g><g><title>CoreAudio`invocation function for block in HALC_ProxyIOContext::HALC_ProxyIOContext (590 samples, 34.44%)</title><rect x="65.5575%" y="405" width="34.4425%" height="15" fill="rgb(249,222,13)" fg:x="1123" fg:w="590"/><text x="65.8075%" y="415.50">CoreAudio`invocation function for block in HALC_ProxyIOC..</text></g><g><title>libsystem_platform.dylib`_platform_memset (1 samples, 0.06%)</title><rect x="99.9416%" y="389" width="0.0584%" height="15" fill="rgb(244,185,38)" fg:x="1712" fg:w="1"/><text x="100.1916%" y="399.50"></text></g></svg></svg>
